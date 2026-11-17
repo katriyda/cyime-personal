@@ -1,0 +1,377 @@
+name: Build packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish one release per package"
+        type: boolean
+        default: false
+      package_id:
+        description: "Only build this package id (empty = all)"
+        default: ""
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 18 * * *"
+
+concurrency:
+  group: cyime-personal-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: Cyletix/CyIME
+  UPSTREAM_REF: main
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+      gate_required: ${{ steps.decide.outputs.gate_required }}
+      packages: ${{ steps.selected.outputs.packages }}
+      upstream_head: ${{ steps.upstream.outputs.head }}
+      upstream_name: ${{ steps.upstream_version.outputs.name }}
+      upstream_code: ${{ steps.upstream_version.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check package list syntax
+        run: python3 -c "import json; d=json.load(open('packages.json', encoding='utf-8')); assert d['packages']; print([p['id'] for p in d['packages']])"
+
+      - name: Read upstream head
+        id: upstream
+        run: |
+          HEAD=$(git ls-remote "https://github.com/$UPSTREAM.git" "refs/heads/$UPSTREAM_REF" | cut -f1)
+          echo "head=$HEAD" >> "$GITHUB_OUTPUT"
+          echo "SHA=$HEAD" >> "$GITHUB_ENV"
+
+      - name: Clone upstream
+        run: |
+          git clone --filter=blob:none "https://github.com/$UPSTREAM.git" upstream
+          git -C upstream checkout --detach "$SHA"
+
+      - name: Read upstream version
+        id: upstream_version
+        run: |
+          NAME=$(python3 scripts/read_upstream_version.py upstream --key versionName)
+          CODE=$(python3 scripts/read_upstream_version.py upstream --key versionCode)
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+
+      - name: Select packages and resolve versions
+        id: selected
+        env:
+          PACKAGE_ID: ${{ inputs.package_id }}
+          UPSTREAM_NAME: ${{ steps.upstream_version.outputs.name }}
+          UPSTREAM_CODE: ${{ steps.upstream_version.outputs.code }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, subprocess, sys
+          data = json.load(open("packages.json", encoding="utf-8"))
+          selected = data["packages"]
+          wanted = os.environ.get("PACKAGE_ID", "").strip()
+          if wanted:
+              selected = [p for p in selected if p["id"] == wanted]
+              if not selected:
+                  sys.exit(f"unknown package id: {wanted}")
+          base = os.environ["UPSTREAM_NAME"].strip()
+          m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", base)
+          if not m:
+              sys.exit(f"upstream version is not plain semver: {base}")
+          major, minor, patch = map(int, m.groups())
+          listed = subprocess.run(
+              ["gh", "release", "list", "--limit", "200", "--json", "tagName"],
+              capture_output=True, text=True, check=True,
+          )
+          tags = {row["tagName"] for row in json.loads(listed.stdout)}
+          resolved = []
+          for package in selected:
+              prefix = package.get("suffix") or ""
+              tag = f"{prefix}-v{major}.{minor}.{patch}"
+              rebuild = tag in tags
+              package_version = f"{major}.{minor}.{patch + (1 if rebuild else 0)}"
+              code = int(os.environ["UPSTREAM_CODE"]) * 10 + (1 if rebuild else 0)
+              if code > 2147483647:
+                  sys.exit("computed versionCode exceeds Android limit")
+              resolved.append(dict(
+                  package,
+                  version=package_version,
+                  versionCode=code,
+                  tag=f"{prefix}-v{package_version}",
+              ))
+          print("packages=" + json.dumps(resolved, ensure_ascii=False))
+          PY
+
+      - name: Skip scheduled build when packages already target this commit
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD: ${{ steps.upstream.outputs.head }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "gate_required=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "gate_required=false" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, urllib.request
+          data = json.load(open("packages.json", encoding="utf-8"))
+          head = os.environ["HEAD"]
+          request = urllib.request.Request(
+              "https://api.github.com/repos/{}/releases?per_page=100".format(os.environ["GITHUB_REPOSITORY"]),
+              headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                       "Accept": "application/vnd.github+json",
+                       "User-Agent": "cyime-personal-ci"},
+          )
+          with urllib.request.urlopen(request) as response:
+              releases = json.load(response)
+          # The release body records the upstream commit; fork tags point at
+          # fork commits and cannot use targetCommitish for this comparison.
+          covered = set()
+          for row in releases:
+              if head not in (row.get("body") or ""):
+                  continue
+              matched = re.match(r"([a-z0-9_-]+)-v\d", row.get("tag_name", ""))
+              if matched:
+                  covered.add(matched.group(1))
+          missing = [p["suffix"] for p in data["packages"] if p["suffix"] not in covered]
+          print("should_build=" + ("false" if not missing else "true"))
+          print(f"missing_packages={','.join(missing)}")
+          PY
+
+  gate:
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true' && needs.prepare.outputs.gate_required == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: fork
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Clone upstream
+        run: |
+          git clone "https://github.com/$UPSTREAM.git" upstream
+          git -C upstream checkout --detach "${{ needs.prepare.outputs.upstream_head }}"
+          git -C upstream submodule update --init --recursive --depth 1
+      - name: Patch first package before tests
+        env:
+          PACKAGES_JSON: ${{ needs.prepare.outputs.packages }}
+        run: |
+          VERSION=$(python3 -c "import json,os; print(json.loads(os.environ['PACKAGES_JSON'])[0]['version'])")
+          VERSION_CODE=$(python3 -c "import json,os; print(json.loads(os.environ['PACKAGES_JSON'])[0]['versionCode'])")
+          PKG=$(python3 -c "import json,sys; print(json.load(open('fork/packages.json'))['packages'][0]['id'])")
+          cp fork/signing/ci-cert-sha256.txt upstream/signing-ci-cert-sha256.txt
+          python3 fork/scripts/patch_upstream.py upstream \
+            --repo "${{ github.repository }}" \
+            --packages fork/packages.json \
+            --package-id "$PKG" \
+            --cert upstream/signing-ci-cert-sha256.txt \
+            --version-name "$VERSION" \
+            --version-code "$VERSION_CODE"
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Install NDK and build tools
+        run: |
+          sdkmanager "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+      - name: Cache native deps
+        uses: actions/cache@v6
+        with:
+          path: |
+            upstream/app/src/main/jni/onnxruntime
+            upstream/app/src/main/jniLibs/**/libonnxruntime.so
+          key: native-${{ runner.os }}-${{ hashFiles('upstream/app/build-logic/tasks-native.gradle.kts') }}
+          restore-keys: native-${{ runner.os }}-
+      - name: Download native deps
+        working-directory: upstream
+        run: ./gradlew downloadOnnx --no-daemon
+      - name: Unit tests
+        working-directory: upstream
+        run: ./gradlew :app:testDebugUnitTest :plugin-core:testDebugUnitTest --no-daemon
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Required rendered layout gate
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 29
+          arch: x86_64
+          profile: pixel_3a
+          script: |
+            cd "$GITHUB_WORKSPACE/upstream"
+            chmod +x gradlew
+            ./gradlew :app:connectedDebugAndroidTest \
+              -Pandroid.testInstrumentationRunnerArguments.class=com.kingzcheung.xime.ui.LayoutGeometryGateTest,com.kingzcheung.xime.ui.PanelLayoutAuditTest,com.kingzcheung.xime.ui.ExpandedCandidateLayoutTest,com.kingzcheung.xime.ui.OfflineEditionTest,com.kingzcheung.xime.ui.VisualStyleIntegrationTest,com.kingzcheung.xime.ui.IconAppearanceTest \
+              --no-daemon
+
+  build:
+    needs: [prepare, gate]
+    if: |
+      needs.prepare.outputs.should_build == 'true' &&
+      (needs.prepare.outputs.gate_required == 'false' || needs.gate.result == 'success')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.prepare.outputs.packages) }}
+    name: build ${{ matrix.package.id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: fork
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Clone upstream
+        run: |
+          git clone "https://github.com/$UPSTREAM.git" upstream
+          git -C upstream checkout --detach "${{ needs.prepare.outputs.upstream_head }}"
+          git -C upstream submodule update --init --recursive --depth 1
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools
+      - name: Install NDK and build tools
+        run: |
+          sdkmanager "ndk;29.0.14206865"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$ANDROID_HOME/ndk/29.0.14206865" >> "$GITHUB_ENV"
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+      - name: Cache native deps
+        uses: actions/cache@v6
+        with:
+          path: |
+            upstream/app/src/main/jni/onnxruntime
+            upstream/app/src/main/jniLibs/**/libonnxruntime.so
+          key: native-${{ runner.os }}-${{ hashFiles('upstream/app/build-logic/tasks-native.gradle.kts') }}
+          restore-keys: native-${{ runner.os }}-
+      - name: Download native deps
+        working-directory: upstream
+        run: ./gradlew downloadOnnx --no-daemon
+      - name: Apply package patch
+        env:
+          PKG_ID: ${{ matrix.package.id }}
+          VERSION: ${{ matrix.package.version }}
+          VERSION_CODE: ${{ matrix.package.versionCode }}
+        run: |
+          cp fork/signing/ci-cert-sha256.txt upstream/signing-ci-cert-sha256.txt
+          python3 fork/scripts/patch_upstream.py upstream \
+            --repo "${{ github.repository }}" \
+            --packages fork/packages.json \
+            --package-id "$PKG_ID" \
+            --cert upstream/signing-ci-cert-sha256.txt \
+            --version-name "$VERSION" \
+            --version-code "$VERSION_CODE"
+      - name: Prepare signing properties
+        run: |
+          cat > upstream/app/keystore.properties <<EOF
+          keyBase64=${{ secrets.SIGNING_KEY }}
+          storePassword=${{ secrets.KEY_STORE_PASSWORD }}
+          keyAlias=${{ secrets.ALIAS }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          EOF
+      - name: Build release APK (ARM64)
+        working-directory: upstream
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease \
+            -I scripts/phone-release-abi.gradle \
+            -PcyimeReleaseAbi=arm64-v8a \
+            --no-daemon
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          cp upstream/app/build/outputs/apk/release/*-arm64-v8a.apk out/
+          ls -l out
+      - name: Verify APK identity, version and signature
+        env:
+          EXPECTED_ID: ${{ matrix.package.applicationId }}
+          EXPECTED_CODE: ${{ matrix.package.versionCode }}
+          EXPECTED_NAME: ${{ matrix.package.version }}
+          CERT_FILE: fork/signing/ci-cert-sha256.txt
+        run: |
+          set -euo pipefail
+          APK=$(find out -name '*.apk' -type f | head -1)
+          AAPT2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | tail -1)
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)
+          "$AAPT2" dump badging "$APK" > badging.txt
+          grep -F "package: name='$EXPECTED_ID'" badging.txt
+          grep -F "versionCode='$EXPECTED_CODE'" badging.txt
+          grep -F "versionName='$EXPECTED_NAME'" badging.txt
+          if grep -Fq "application-debuggable" badging.txt; then
+            echo "::error::release APK is debuggable"; exit 1
+          fi
+          "$APKSIGNER" verify --verbose --min-sdk-version 28 --print-certs "$APK" > sig.txt
+          grep -Fq "Verified using v1 scheme (JAR signing): true" sig.txt || { echo "::error::no v1 signature"; exit 1; }
+          grep -Fq "Verified using v2 scheme (APK Signature Scheme v2): true" sig.txt || { echo "::error::no v2 signature"; exit 1; }
+          FP=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' sig.txt | head -1 | tr '[:upper:]' '[:lower:]' | tr -d ':')
+          grep -Fixq "$FP" "$CERT_FILE" || { echo "::error::unexpected signing certificate $FP"; exit 1; }
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.package.id }}-${{ matrix.package.version }}
+          path: out/*.apk
+          retention-days: 14
+
+  publish:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_build == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      max-parallel: 1
+      matrix:
+        package: ${{ fromJSON(needs.prepare.outputs.packages) }}
+    name: publish ${{ matrix.package.id }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ matrix.package.id }}-${{ matrix.package.version }}
+          path: out
+      - name: Publish this package's own release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ matrix.package.tag }}
+          VERSION: ${{ matrix.package.version }}
+          UPSTREAM_HEAD: ${{ needs.prepare.outputs.upstream_head }}
+          PKG_ID: ${{ matrix.package.id }}
+          PKG_APP: ${{ matrix.package.applicationId }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists"
+            exit 0
+          fi
+          APK=$(find out -name '*.apk' -type f | head -1)
+          gh release create "$TAG" "$APK" \
+            --title "CyIME $VERSION ($PKG_ID)" \
+            --notes "非官方个人构建。包名: \`$PKG_APP\`。源码: $UPSTREAM@$UPSTREAM_HEAD。只供该包名独立更新。"
+

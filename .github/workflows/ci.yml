@@ -1,0 +1,37 @@
+name: Validate fork
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Validate package list
+        run: |
+          python3 - <<'PY'
+          import json, re, sys
+          data = json.load(open("packages.json", encoding="utf-8"))
+          assert data["packages"], "packages must not be empty"
+          seen_ids, seen_apps, seen_suffixes = set(), set(), set()
+          for p in data["packages"]:
+              assert re.fullmatch(r"[a-z][a-z0-9_.]*", p["applicationId"]), p
+              assert p["id"] not in seen_ids and p["applicationId"] not in seen_apps, p
+              suffix = p.get("suffix") or ""
+              assert suffix not in seen_suffixes, p
+              seen_ids.add(p["id"]); seen_apps.add(p["applicationId"]); seen_suffixes.add(suffix)
+          print("packages:", [p["id"] for p in data["packages"]])
+          PY
+      - name: Compile scripts
+        run: python3 -m py_compile scripts/*.py
+      - name: Check certificate fingerprint is present
+        run: test -s signing/ci-cert-sha256.txt

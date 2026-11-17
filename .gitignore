@@ -1,0 +1,17 @@
+# Private signing material must never enter the public repository.
+/signing/*.jks
+/signing/*.keystore
+/signing/*.p12
+/signing/*.pem
+/signing/*.der
+/signing/b64.txt
+/signing/secrets.env
+/upstream/
+/out/
+/dist/
+*.apk
+*.aab
+*.part
+__pycache__/
+*.pyc
+.DS_Store

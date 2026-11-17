@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "appName": "CyIME",
+  "defaultPackage": "standard",
+  "packages": [
+    {
+      "id": "standard",
+      "applicationId": "com.katriyda.cyime",
+      "label": "CyIME Personal",
+      "suffix": "standard"
+    },
+    {
+      "id": "hyperos",
+      "applicationId": "com.katriyda.cyime.hyperos",
+      "label": "CyIME HyperOS",
+      "suffix": "hyperos"
+    }
+  ]
+}
