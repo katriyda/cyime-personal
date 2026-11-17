@@ -94,7 +94,8 @@ def resolve(
             f"repos/{own_repo}/releases?per_page=100",
         )
     )
-    existing = {row["tagName"]: row.get("body") or "" for row in own}
+    # This is the REST shape (tag_name), not gh's --json shape (tagName).
+    existing = {row["tag_name"]: row.get("body") or "" for row in own}
 
     major, minor, patch = version_tuple(version_name)
     resolved = []
