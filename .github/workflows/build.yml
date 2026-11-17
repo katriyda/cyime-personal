@@ -183,7 +183,8 @@ jobs:
           "$APKSIGNER" verify --verbose --min-sdk-version 23 --print-certs "$APK" > sig.txt
           grep -Fq "Verified using v1 scheme (JAR signing): true" sig.txt || { echo "::error::no v1 signature"; exit 1; }
           grep -Fq "Verified using v2 scheme (APK Signature Scheme v2): true" sig.txt || { echo "::error::no v2 signature"; exit 1; }
-          FP=$(grep -oE '[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){31}' sig.txt | head -1 | tr '[:upper:]' '[:lower:]' | tr -d ':')
+          keytool -printcert -jarfile "$APK" > cert.txt
+          FP=$(sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' cert.txt | head -1 | tr '[:upper:]' '[:lower:]' | tr -d ':')
           test -n "$FP" || { echo "::error::cannot read signing certificate"; exit 1; }
           grep -Fixq "$FP" "$CERT_FILE" || { echo "::error::unexpected signing certificate $FP"; exit 1; }
       - uses: actions/upload-artifact@v7
