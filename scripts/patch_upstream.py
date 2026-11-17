@@ -343,14 +343,26 @@ def use_official_prebuilt_library(
     if f"versionName='{upstream_version}'" not in badging:
         fail(f"官方 APK 的版本不是 {upstream_version}")
         return
-    signature = subprocess.run(
-        [str(apksigner), "verify", "--verbose", "--print-certs", str(apk)],
+    keytool = os.environ.get("JAVA_HOME", "")
+    keytool_path = Path(keytool) / "bin" / "keytool" if keytool else Path("keytool")
+    keytool_output = subprocess.run(
+        [str(keytool_path), "-printcert", "-jarfile", str(apk)],
         check=True, capture_output=True, text=True,
     ).stdout
-    cert = re.search(
-        r"Signer #1 certificate SHA-256 digest:\s*([0-9a-fA-F:]+)", signature
-    )
+    cert = re.search(r"SHA256:\s*([0-9a-fA-F:]+)", keytool_output)
     fingerprint = cert.group(1).replace(":", "").lower() if cert else ""
+    if not fingerprint:
+        signature = subprocess.run(
+            [str(apksigner), "verify", "--verbose", "--print-certs", str(apk)],
+            check=True, capture_output=True, text=True,
+        )
+        combined = signature.stdout + signature.stderr
+        cert = re.search(
+            r"Signer #1 certificate SHA-256 digest:\s*([0-9a-fA-F:]+)", combined
+        )
+        fingerprint = cert.group(1).replace(":", "").lower() if cert else ""
+        if not fingerprint:
+            print("apksigner 输出：\n" + combined, file=sys.stderr)
     if fingerprint != official_cert:
         fail(f"官方 APK 签名不匹配: {fingerprint or 'unknown'}")
         return
