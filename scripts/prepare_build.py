@@ -90,14 +90,8 @@ def resolve(
 
     own = json.loads(
         gh(
-            "release",
-            "list",
-            "--repo",
-            own_repo,
-            "--limit",
-            "200",
-            "--json",
-            "tagName,body",
+            "api",
+            f"repos/{own_repo}/releases?per_page=100",
         )
     )
     existing = {row["tagName"]: row.get("body") or "" for row in own}
