@@ -178,7 +178,9 @@ jobs:
           if grep -Fq "application-debuggable" badging.txt; then
             echo "::error::release APK is debuggable"; exit 1
           fi
-          "$APKSIGNER" verify --verbose --min-sdk-version 28 --print-certs "$APK" > sig.txt
+          # minSdk >= 24 makes apksigner skip v1 and report it false, so verify
+          # with 23 even though the app itself requires 28 (same as upstream).
+          "$APKSIGNER" verify --verbose --min-sdk-version 23 --print-certs "$APK" > sig.txt
           grep -Fq "Verified using v1 scheme (JAR signing): true" sig.txt || { echo "::error::no v1 signature"; exit 1; }
           grep -Fq "Verified using v2 scheme (APK Signature Scheme v2): true" sig.txt || { echo "::error::no v2 signature"; exit 1; }
           FP=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' sig.txt | head -1 | tr '[:upper:]' '[:lower:]' | tr -d ':')
