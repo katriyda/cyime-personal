@@ -291,6 +291,103 @@ def patch_version(root: Path, version_name: str, version_code: str) -> None:
         )
 
 
+def read_official_cert(root: Path) -> str:
+    text = read(root, "app/src/main/java/com/kingzcheung/xime/security/InstallIntegrity.kt")
+    match = re.search(r"OFFICIAL_CERTS[^=]*=\s*setOf\(([^)]*)\)", text, re.DOTALL)
+    if match is None:
+        return ""
+    cert = re.search(r'"([0-9a-fA-F]{64})"', match.group(1))
+    return cert.group(1).lower() if cert else ""
+
+
+def use_official_prebuilt_library(
+    root: Path,
+    apk: Path,
+    apksigner: Path,
+    upstream_tag: str,
+    upstream_version: str,
+    official_cert: str,
+) -> None:
+    """Use the same release's official APK as the native-library source.
+
+    Upstream 1.15.94's source pins libcytranslate.so to a prebuilt asset in the
+    ``models`` release, but that asset is gone (HTTP 404). The official APK
+    from the same tag still contains the library, so use that exact binary
+    after verifying the APK is the genuine upstream build. This keeps offline
+    translation working without recompiling slimt.
+    """
+    import hashlib
+    import subprocess
+    import zipfile
+
+    if not apk.is_file():
+        fail(f"缺少官方 APK: {apk}")
+        return
+    if not apksigner.is_file():
+        fail(f"缺少 apksigner: {apksigner}")
+        return
+    if not official_cert:
+        fail("读不到上游官方签名证书")
+        return
+    aapt2 = apksigner.parent / "aapt2"
+    if not aapt2.is_file():
+        fail(f"缺少 aapt2: {aapt2}")
+        return
+    badging = subprocess.run(
+        [str(aapt2), "dump", "badging", str(apk)],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    if "package: name='com.cyletix.cyime'" not in badging:
+        fail("官方 APK 的包名不是 com.cyletix.cyime")
+        return
+    if f"versionName='{upstream_version}'" not in badging:
+        fail(f"官方 APK 的版本不是 {upstream_version}")
+        return
+    signature = subprocess.run(
+        [str(apksigner), "verify", "--verbose", "--print-certs", str(apk)],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    cert = re.search(
+        r"Signer #1 certificate SHA-256 digest:\s*([0-9a-fA-F:]+)", signature
+    )
+    fingerprint = cert.group(1).replace(":", "").lower() if cert else ""
+    if fingerprint != official_cert:
+        fail(f"官方 APK 签名不匹配: {fingerprint or 'unknown'}")
+        return
+
+    with zipfile.ZipFile(apk) as archive:
+        entry = "lib/arm64-v8a/libcytranslate.so"
+        if entry not in archive.namelist():
+            fail(f"官方 APK 中没有 {entry}")
+            return
+        payload = archive.read(entry)
+    digest = hashlib.sha256(payload).hexdigest()
+    local = root / ".codex-artifacts" / "offline-translate" / "libs" / "arm64-v8a"
+    local.mkdir(parents=True, exist_ok=True)
+    (local / "libcytranslate.so").write_bytes(payload)
+    (local / f"libcytranslate-{digest[:8]}-arm64-v8a.so").write_bytes(payload)
+    # The build task verifies every listed ABI. Remove x86_64 because this
+    # delivery builds only arm64, and pin arm64 to the official binary.
+    script = "app/build-logic/tasks-offline-translate.gradle.kts"
+    text = read(root, script)
+    if not text:
+        return
+    updated, count = re.subn(
+        r"val offlineTranslateLibraryHashes = mapOf<String, String>\(\n.*?\n\)",
+        'val offlineTranslateLibraryHashes = mapOf<String, String>(\n'
+        f'    "arm64-v8a" to "{digest}",\n'
+        ")",
+        text,
+        count=1,
+        flags=re.DOTALL,
+    )
+    if count != 1:
+        fail("锚点不匹配（offlineTranslateLibraryHashes）")
+        return
+    write(root, script, updated)
+    print(f"使用官方 {upstream_tag} APK 的离线翻译库: {digest}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("root", type=Path, help="upstream source root")
@@ -300,6 +397,10 @@ def main() -> int:
     parser.add_argument("--cert", type=Path, required=True)
     parser.add_argument("--version-name", default="")
     parser.add_argument("--version-code", default="")
+    parser.add_argument("--official-apk", type=Path, default=None)
+    parser.add_argument("--apksigner", type=Path, default=None)
+    parser.add_argument("--upstream-tag", default="")
+    parser.add_argument("--upstream-version", default="")
     args = parser.parse_args()
 
     root = args.root.resolve()
@@ -313,11 +414,24 @@ def main() -> int:
     payload = load_packages(args.packages.resolve())
     package = package_by_id(payload, args.package_id)
     suffix = str(package.get("suffix") or "")
+    official_cert = read_official_cert(root)
 
     patch_identity(root, package)
     patch_update_channel(root, args.repo, suffix)
     patch_signature_gate(root, args.cert.resolve())
     patch_version(root, args.version_name, args.version_code)
+    if args.official_apk is not None:
+        if args.apksigner is None or not args.upstream_tag or not args.upstream_version:
+            fail("使用官方 APK 时需要 --apksigner、--upstream-tag、--upstream-version")
+        else:
+            use_official_prebuilt_library(
+                root,
+                args.official_apk.resolve(),
+                args.apksigner.resolve(),
+                args.upstream_tag,
+                args.upstream_version,
+                official_cert,
+            )
 
     if FAILS:
         print("补丁失败，拒绝继续构建：", file=sys.stderr)

@@ -109,20 +109,36 @@ jobs:
       - name: Download native dependencies
         working-directory: upstream
         run: ./gradlew downloadOnnx --no-daemon
+      - name: Download same-release official APK for pinned libraries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+        run: |
+          mkdir -p official
+          gh release download "$UPSTREAM_TAG" --repo "$UPSTREAM" \
+            --pattern "CyIME-${UPSTREAM_TAG}-arm64-v8a.apk" --dir official
+          test -s "official/CyIME-${UPSTREAM_TAG}-arm64-v8a.apk"
       - name: Apply minimal identity patch
         env:
           PKG_ID: ${{ matrix.package.id }}
           VERSION: ${{ matrix.package.version }}
           VERSION_CODE: ${{ matrix.package.versionCode }}
+          UPSTREAM_TAG: ${{ needs.prepare.outputs.upstream_tag }}
+          UPSTREAM_VERSION: ${{ needs.prepare.outputs.upstream_version }}
         run: |
           cp fork/signing/ci-cert-sha256.txt upstream/signing-ci-cert-sha256.txt
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | tail -1)
           python3 fork/scripts/patch_upstream.py upstream \
             --repo "${{ github.repository }}" \
             --packages fork/packages.json \
             --package-id "$PKG_ID" \
             --cert upstream/signing-ci-cert-sha256.txt \
             --version-name "$VERSION" \
-            --version-code "$VERSION_CODE"
+            --version-code "$VERSION_CODE" \
+            --official-apk "official/CyIME-${UPSTREAM_TAG}-arm64-v8a.apk" \
+            --apksigner "$APKSIGNER" \
+            --upstream-tag "$UPSTREAM_TAG" \
+            --upstream-version "$UPSTREAM_VERSION"
       - name: Prepare signing properties
         run: |
           cat > upstream/app/keystore.properties <<EOF

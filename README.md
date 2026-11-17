@@ -5,16 +5,20 @@
 这个仓库只维护“发行身份”和自动发布流程，不保存上游源码：
 
 - `packages.json`：要发布的全部包名。每一项都会构建、校验并发布到自己的 Release。
-- `scripts/patch_upstream.py`：在 CI 临时拉取的上游源码上注入包名、应用名、独立更新通道和签名白名单。
-- `scripts/read_upstream_version.py`：读取上游版本。
-- `.github/workflows/build.yml`：测试门禁、按包名矩阵构建、APK 身份校验、每个包名独立发布。
+- `scripts/prepare_build.py`：读取官方最新正式版 Release 标签，按包名计算独立版本。
+- `scripts/patch_upstream.py`：在官方源码副本上只改包名、应用名、更新通道、签名白名单和版本号。
+- `.github/workflows/build.yml`：按包名矩阵构建、校验 APK 身份与签名、每个包名独立发布。
 - `.github/workflows/ci.yml`：只校验包名清单和脚本语法，不构建。
+
+## 跟随官方版本
+
+每次运行都取官方最新、非草稿、非预发布的 `x.y.z` Release 标签源码，不跟踪 `main`。官方发布新版本后，定时任务自动构建并发布对应的独立包；同一上游版本已经发布过的包会跳过，手动运行可加 `force` 重建。
 
 ## 发布方式
 
 每个包名的 Release tag 是 `<suffix>-v<version>`，安装包只包含该包自己的资产。应用内更新只接受本包前缀的 tag，因此不同包名不会互相下载。
 
-定时任务每天检查上游；上游有新提交时自动构建并发布。也可以手动运行 `Build packages` 并选择 `publish`。
+定时任务每天检查官方最新正式版。也可以手动运行 `Build packages`：`package_id` 留空构建全部包名，`publish` 默认开启。
 
 ## 添加包名
 
