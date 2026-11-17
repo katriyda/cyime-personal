@@ -91,7 +91,7 @@ jobs:
           packages: platform-tools
       - name: Install NDK and native build tools
         run: |
-          NDK_VERSION=$(sed -n 's/^[[:space:]]*ndkVersion = "([^"]+)"/\1/p' upstream/app/build.gradle.kts | head -1)
+          NDK_VERSION=$(grep -oP '^\s*ndkVersion = "\K[^"]+' upstream/app/build.gradle.kts | head -1)
           test -n "$NDK_VERSION"
           sdkmanager "ndk;$NDK_VERSION"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
