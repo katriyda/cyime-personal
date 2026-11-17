@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Turn upstream CyIME into one independently-updatable package.
+"""Patch an upstream CyIME checkout into one independently-updatable package.
 
-CI clones the upstream source fresh on every run. This repository keeps only
-packages.json, the signing certificate fingerprint, this patch script and the
-workflows. Patches must be anchored and fail closed: an incomplete patch must
-never produce a publishable APK.
+The repository intentionally does not vendor upstream source. CI checks out the
+latest stable upstream release into a temporary directory and applies only the
+release identity needed for an independent APK:
+
+- applicationId and visible app/IME label
+- update repository, release tag prefix and signing-certificate allowlist
+- versionName / versionCode used for this package
+
+Every anchor must match exactly once. If upstream moves an anchor, the build
+fails instead of silently publishing an APK that updates from the wrong place.
 """
 from __future__ import annotations
 
@@ -66,38 +72,24 @@ def load_packages(path: Path) -> dict:
     if not isinstance(packages, list) or not packages:
         print("packages.json 必须包含非空 packages 数组", file=sys.stderr)
         raise SystemExit(2)
-    ids: set[str] = set()
-    app_ids: set[str] = set()
-    suffixes: set[str] = set()
+    seen: dict[str, set[str]] = {"id": set(), "applicationId": set(), "suffix": set()}
     for item in packages:
         if not isinstance(item, dict):
-            print("packages 每项必须是对象", file=sys.stderr)
-            raise SystemExit(2)
-        missing = [key for key in ("id", "applicationId", "label") if not item.get(key)]
-        if missing:
-            print(f"包名项缺少字段 {missing}: {item}", file=sys.stderr)
-            raise SystemExit(2)
+            raise SystemExit("packages 每项必须是对象")
+        for key in ("id", "applicationId", "label"):
+            if not item.get(key):
+                raise SystemExit(f"包名项缺少字段 {key}: {item}")
         package_id = str(item["id"])
-        if package_id in ids:
-            print(f"重复的包 id: {package_id}", file=sys.stderr)
-            raise SystemExit(2)
         application_id = str(item["applicationId"])
-        if application_id in app_ids:
-            print(f"重复的 applicationId: {application_id}", file=sys.stderr)
-            raise SystemExit(2)
-        if not re.fullmatch(r"[a-z][a-z0-9_.]*", application_id):
-            print(f"非法 applicationId: {application_id}", file=sys.stderr)
-            raise SystemExit(2)
         suffix = str(item.get("suffix") or "")
+        if not re.fullmatch(r"[a-z][a-z0-9_.]*", application_id):
+            raise SystemExit(f"非法 applicationId: {application_id}")
         if suffix and not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", suffix):
-            print(f"非法 suffix: {suffix}", file=sys.stderr)
-            raise SystemExit(2)
-        if suffix in suffixes:
-            print(f"重复的 suffix: {suffix}", file=sys.stderr)
-            raise SystemExit(2)
-        ids.add(package_id)
-        app_ids.add(application_id)
-        suffixes.add(suffix)
+            raise SystemExit(f"非法 suffix: {suffix}")
+        for key, value in (("id", package_id), ("applicationId", application_id), ("suffix", suffix)):
+            if value in seen[key]:
+                raise SystemExit(f"重复的 {key}: {value}")
+            seen[key].add(value)
     return payload
 
 
@@ -125,8 +117,6 @@ def patch_identity(root: Path, package: dict) -> None:
         f'<string name="app_name" translatable="false">{label}</string>',
         "app_name",
     )
-    # The IME service label is a literal on purpose, so the system picker still
-    # shows a readable name if resources are unavailable mid-update.
     replace_once(
         root,
         "app/src/main/AndroidManifest.xml",
@@ -141,14 +131,7 @@ def patch_identity(root: Path, package: dict) -> None:
         "app/src/main/AndroidManifest.xml",
         r'<action android:name="com\.cyletix\.cyime\.DEV_LEARNING" />',
         f'<action android:name="{app_id}.DEV_LEARNING" />',
-        "manifest DEV_LEARNING action",
-    )
-    replace_once(
-        root,
-        "app/src/main/AndroidManifest.xml",
-        r'applicationId（com\.cyletix\.cyime）',
-        f"applicationId（{app_id}）",
-        "manifest identity comment",
+        "DEV_LEARNING action",
     )
     replace_once(
         root,
@@ -164,31 +147,10 @@ def patch_identity(root: Path, package: dict) -> None:
         f'const val PREVIEW_EDITOR = "{app_id}.settings.preview"',
         "PREVIEW_EDITOR",
     )
-    replace_once(
-        root,
-        "app/src/androidTest/java/com/kingzcheung/xime/ExampleInstrumentedTest.kt",
-        r'assertEquals\("com\.cyletix\.cyime", appContext\.packageName\)',
-        f'assertEquals("{app_id}", appContext.packageName)',
-        "ExampleInstrumentedTest package",
-    )
-    replace_once(
-        root,
-        "app/src/androidTest/java/com/kingzcheung/xime/settings/AppearanceDeliveryTest.kt",
-        r'assertEquals\("com\.cyletix\.cyime", context\.packageName\)',
-        f'assertEquals("{app_id}", context.packageName)',
-        "AppearanceDeliveryTest package",
-    )
-    replace_once(
-        root,
-        "app/src/main/java/com/kingzcheung/xime/service/DevLearningReceiver.kt",
-        r'adb shell am broadcast -n com\.cyletix\.cyime/com\.kingzcheung\.xime\.service\.DevLearningReceiver -a com\.cyletix\.cyime\.DEV_LEARNING',
-        f"adb shell am broadcast -n {app_id}/com.kingzcheung.xime.service.DevLearningReceiver -a {app_id}.DEV_LEARNING",
-        "DevLearningReceiver doc",
-    )
 
 
-def patch_update_catalog(root: Path, repo: str, suffix: str) -> None:
-    """Point every update URL at this repository; accept only this package's tags."""
+def patch_update_channel(root: Path, repo: str, suffix: str) -> None:
+    """Point updates at this repository and accept only this package's tags."""
     catalog = "app/src/main/java/com/kingzcheung/xime/update/AppUpdateCatalog.kt"
     updater = "app/src/main/java/com/kingzcheung/xime/update/AppUpdater.kt"
     prefix = f"{suffix}-" if suffix else ""
@@ -228,52 +190,6 @@ def patch_update_catalog(root: Path, repo: str, suffix: str) -> None:
         "const val MODELSCOPE_PAGE = RELEASES_PAGE",
         "MODELSCOPE_PAGE",
     )
-    # Update tests document upstream behavior. Rewrite both the URL and the
-    # tag fixture so these tests still exercise this package's channel.
-    test_file = "app/src/test/java/com/kingzcheung/xime/update/AppUpdateCatalogTest.kt"
-    text = read(root, test_file)
-    if text:
-        text = text.replace(
-            'https://github.com/Cyletix/CyIME/releases/download/x/$name',
-            f'https://github.com/{repo}/releases/download/x/$name',
-        )
-        text = text.replace(
-            'https://github.com/Cyletix/CyIME/releases/tag/$tag',
-            f'https://github.com/{repo}/releases/tag/$tag',
-        )
-        text = text.replace(
-            'https://github.com/Cyletix/CyIME/releases/tag/1.14.156',
-            f'https://github.com/{repo}/releases/tag/{prefix}1.14.156',
-        )
-        write(root, test_file, text)
-    replace_once(
-        root,
-        "app/src/test/java/com/kingzcheung/xime/update/AppUpdateCatalogTest.kt",
-        r'"""\{"tag_name":"\$tag"',
-        f'"""{{"tag_name":"{prefix}$tag"',
-        "test release tag prefix",
-    )
-    # This fork has no domestic mirror. Replace upstream's mirror tests with
-    # one assertion that both locales open this fork's own release page.
-    text = read(root, test_file)
-    if text:
-        start = text.find(
-            "    // Same shape scripts/store/sync_modelscope.py app writes"
-        )
-        end = text.find("    @Test\n    fun fdroidInstallsAreStoreManaged()")
-        if start < 0 or end < 0 or end <= start:
-            fail("锚点不匹配（mirror test block）")
-        else:
-            replacement = (
-                "    @Test\n"
-                f"    fun releasesPageUsesThisFork() {{\n"
-                f'        assertEquals(AppUpdateCatalog.RELEASES_PAGE, AppUpdateCatalog.releasesPage(domestic = true))\n'
-                f'        assertEquals(AppUpdateCatalog.RELEASES_PAGE, AppUpdateCatalog.releasesPage(domestic = false))\n'
-                "    }\n\n"
-            )
-            write(root, test_file, text[:start] + replacement + text[end:])
-    # The tag fixture must use this package's prefix; otherwise the update tests
-    # silently pass only because they never exercise the filtered tag.
     # Only this package's own prefix is an update candidate.
     replace_once(
         root,
@@ -306,19 +222,6 @@ def patch_update_catalog(root: Path, repo: str, suffix: str) -> None:
     replace_once(
         root,
         updater,
-        r'^(\s*)if \(fromModelScope\) builder\.url\(AppUpdateCatalog\.MODELSCOPE_RELEASES\)$',
-        r"\1if (fromModelScope) {"
-        "\n"
-        r"\1    if (AppUpdateCatalog.MODELSCOPE_RELEASES.isEmpty()) return null"
-        "\n"
-        r"\1    builder.url(AppUpdateCatalog.MODELSCOPE_RELEASES)"
-        "\n"
-        r"\1}",
-        "modelscope skip",
-    )
-    replace_once(
-        root,
-        updater,
         r'for \(fromModelScope in if \(domestic\) listOf\(true, false\) else listOf\(false, true\)\) \{',
         "for (fromModelScope in listOf(false)) {",
         "update loop",
@@ -333,7 +236,7 @@ def patch_update_catalog(root: Path, repo: str, suffix: str) -> None:
 
 
 def patch_signature_gate(root: Path, cert_file: Path) -> None:
-    """Make the fork accept its own certificate, not the upstream one."""
+    """Accept this fork's certificate, not the upstream one."""
     relative = "app/src/main/java/com/kingzcheung/xime/security/InstallIntegrity.kt"
     if not cert_file.is_file():
         fail(f"缺少签名证书指纹: {cert_file}")
@@ -412,7 +315,7 @@ def main() -> int:
     suffix = str(package.get("suffix") or "")
 
     patch_identity(root, package)
-    patch_update_catalog(root, args.repo, suffix)
+    patch_update_channel(root, args.repo, suffix)
     patch_signature_gate(root, args.cert.resolve())
     patch_version(root, args.version_name, args.version_code)
 
