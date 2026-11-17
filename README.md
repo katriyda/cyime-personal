@@ -46,6 +46,10 @@
 
 不要提交 keystore、口令或 `signing/` 下的私钥文件。
 
+当前 keystore 是 PKCS12 格式，所以 `KEY_PASSWORD` 必须与 `KEY_STORE_PASSWORD` 相同；只改其中一个会导致 CI 在签名时报 “Given final block not properly padded”。
+
+首次发布后不要再更换 keystore，否则已安装的用户无法覆盖升级。
+
 ## 小米全面屏
 
 HyperOS 的“输入法全面屏优化”不是公开的静态包名名单。系统按包名和最低 versionCode 只放行定制输入法，第三方输入法需要 LSPosed 解锁模块。这里的包名只是你自己的独立身份，不冒充任何厂商应用。
